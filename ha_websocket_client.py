@@ -36,7 +36,7 @@ class HomeAssistantClient:
             if auth_required_response.get("type") != "auth_required":
                  raise Exception(f"Unexpected response during connection: {auth_required_response}")
 
-            # Authenticate
+            
             auth_message = {
                 "type": "auth",
                 "access_token": self.token
