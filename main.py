@@ -15,6 +15,12 @@ app = FastAPI()
 # Persistent connection pool keyed by ws_url
 WS_POOL: Dict[str, "WebsocketClient"] = {}
 
+def short_log(data: dict, limit=300):
+    s = json.dumps(data)
+    if len(s) > limit:
+        return s[:limit] + "... (truncated)"
+    return s
+
 # ======================================================
 # Persistent Websocket Client
 # ======================================================
@@ -86,7 +92,7 @@ class WebsocketClient:
 
                     # We return only the real response (not ping/event)
                     if parsed.get("type") not in ("event", "ping"):
-                        logging.info(f"[RECV RESPONSE] {parsed}")
+                        logging.info(f"[RECV RESPONSE] {short_log(parsed)}")
                         return parsed
 
             except Exception as e:
