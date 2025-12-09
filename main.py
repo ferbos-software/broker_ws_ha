@@ -1,76 +1,136 @@
-import json, random, logging
-import websockets
-from fastapi import FastAPI, Request
+import json
+import logging
 import asyncio
+from typing import Dict, Optional
+from fastapi import FastAPI, Request
+import websockets
 
-# Configure logging
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.INFO
 )
 
 app = FastAPI()
 
+# Persistent connection pool keyed by ws_url
+WS_POOL: Dict[str, "WebsocketClient"] = {}
+
+# ======================================================
+# Persistent Websocket Client
+# ======================================================
+class WebsocketClient:
+    def __init__(self, url: str, token: str):
+        self.url = url
+        self.token = token
+        self.ws = None
+        self.is_connected = False
+        self.lock = asyncio.Lock()
+        self.last_msg_id = 0
+
+    async def connect(self):
+        """Connect once and reuse until error."""
+        async with self.lock:
+            if self.is_connected and self.ws:
+                return  # already online
+
+            logging.info(f"[WS] Connecting to {self.url}...")
+            try:
+                self.ws = await websockets.connect(
+                    self.url,
+                    open_timeout=30,
+                    ping_timeout=30,
+                    close_timeout=10
+                )
+                self.is_connected = True
+
+                await self._do_handshake()
+                logging.info(f"[WS] Connected & authenticated {self.url}")
+
+            except Exception as e:
+                self.is_connected = False
+                self.ws = None
+                logging.error(f"[WS] Connection error: {e}")
+                raise e
+
+    async def _do_handshake(self):
+        # Receive hello
+        hello = await self.ws.recv()
+        logging.info(f"[RECV HELLO] {hello}")
+
+        auth_msg = {
+            "type": "auth",
+            "access_token": self.token
+        }
+        await self.ws.send(json.dumps(auth_msg))
+        logging.info(f"[SEND AUTH] {auth_msg}")
+
+        auth_res = await self.ws.recv()
+        logging.info(f"[RECV AUTH OK] {auth_res}")
+
+    async def request(self, method: str, args: dict) -> dict:
+        """Send method call via persistent connection"""
+        await self.connect()
+
+        async with self.lock:
+            try:
+                self.last_msg_id += 1
+
+                request_obj = { "id": self.last_msg_id, "type": method, **args }
+
+                logging.info(f"[SEND CMD] {request_obj}")
+                await self.ws.send(json.dumps(request_obj))
+
+                while True:
+                    response = await self.ws.recv()
+                    parsed = json.loads(response)
+
+                    # We return only the real response (not ping/event)
+                    if parsed.get("type") not in ("event", "ping"):
+                        logging.info(f"[RECV RESPONSE] {parsed}")
+                        return parsed
+
+            except Exception as e:
+                logging.error(f"[WS ERROR] {e}")
+                self.is_connected = False
+                self.ws = None
+                raise e
+
+
+# ======================================================
+# Helper to get/Create persistent instance
+# ======================================================
+def get_ws_client(ws_url: str, token: str) -> WebsocketClient:
+    if ws_url not in WS_POOL:
+        WS_POOL[ws_url] = WebsocketClient(ws_url, token)
+
+    client = WS_POOL[ws_url]
+    client.token = token  # update token if renewed
+
+    return client
+
+
+# ======================================================
+# API Endpoint
+# ======================================================
 @app.post("/ws_bridge")
 async def websocket_bridge(request: Request):
     data = await request.json()
+
     ws_url = data.get("ws_url")
     token = data.get("token")
     method = data.get("method")
     args = data.get("args", {})
 
-    logging.info(f"[REQUEST] method={method}, args={args}, ws_url={ws_url}")
+    logging.info(f"[REQUEST] {data}")
 
     if not all([ws_url, token, method]):
-        logging.error("[ERROR] Missing parameters")
-        return {"error": "Missing ws_url, token or method"}
-
-    req_id = random.randint(1, 9999999)
+        return {"error": "Missing ws_url, token, or method"}
 
     try:
-        async with websockets.connect(ws_url) as ws:
-            await ws.recv()  # hello
-
-            await ws.send(json.dumps({
-                "type": "auth",
-                "access_token": token
-            }))
-            
-            auth_resp = json.loads(await ws.recv())  # auth_ok
-
-            if auth_resp.get("type") != "auth_ok":
-                return {"error": "Auth Failed"}
-
-            command = {
-                "id": req_id,
-                "type": method,
-                **args
-            }
-
-            logging.info("[SEND CMD] " + json.dumps(command))
-            await ws.send(json.dumps(command))
-
-            while True:
-                msg = await ws.recv()
-                logging.info(f"[RECV AUTH] {msg}")
-                parsed = json.loads(msg)
-
-                # ignore unrelated messages
-                if parsed.get("id") != req_id:
-                    continue
-
-                logging.info(f"[MATCHED RESPONSE] {parsed}")
-
-                # must wait until success response with result payload
-                if parsed.get("type") == "result":
-                    if parsed.get("success") is True:
-                        # result may not always exist
-                        return parsed
+        client = get_ws_client(ws_url, token)
+        result = await client.request(method, args)
+        return result
 
     except Exception as e:
-        logging.exception("[ERROR in websocket_bridge]")
+        logging.error("[FINAL FAILURE ERROR] " + str(e))
         return {"error": str(e)}
-
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
