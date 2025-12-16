@@ -73,27 +73,41 @@ class WebsocketClient:
         auth_res = await self.ws.recv()
         logging.info(f"[RECV AUTH OK] {auth_res}")
 
-    async def request(self, method: str, args: dict) -> dict:
-        """Send method call via persistent connection"""
+    async def _wait_for_response(self):
+        """Wait for non-event/non-ping response"""
+        while True:
+            response = await self.ws.recv()
+            parsed = json.loads(response)
+            
+            # We return only the real response (not ping/event)
+            if parsed.get("type") not in ("event", "ping"):
+                logging.info(f"[RECV RESPONSE] {short_log(parsed)}")
+                return parsed
+
+    async def request(self, method: str, args: dict, timeout: float = 8.0) -> dict:
+        """Send method call via persistent connection with timeout"""
         await self.connect()
 
         async with self.lock:
             try:
                 self.last_msg_id += 1
-
                 request_obj = { "id": self.last_msg_id, "type": method, **args }
 
                 logging.info(f"[SEND CMD] {request_obj}")
                 await self.ws.send(json.dumps(request_obj))
 
-                while True:
-                    response = await self.ws.recv()
-                    parsed = json.loads(response)
-
-                    # We return only the real response (not ping/event)
-                    if parsed.get("type") not in ("event", "ping"):
-                        logging.info(f"[RECV RESPONSE] {short_log(parsed)}")
-                        return parsed
+                # Add timeout for receiving response
+                try:
+                    response = await asyncio.wait_for(
+                        self._wait_for_response(),
+                        timeout=timeout
+                    )
+                    return response
+                except asyncio.TimeoutError:
+                    logging.error(f"[TIMEOUT] No response after {timeout}s for {self.url}")
+                    self.is_connected = False
+                    self.ws = None
+                    raise Exception(f"Request timeout after {timeout}s")
 
             except Exception as e:
                 logging.error(f"[WS ERROR] {e}")
@@ -126,17 +140,18 @@ async def websocket_bridge(request: Request):
     token = data.get("token")
     method = data.get("method")
     args = data.get("args", {})
+    timeout = data.get("timeout", 8.0)  # Default 8 seconds, can be customized
 
-    logging.info(f"[REQUEST] {data}")
+    logging.info(f"[REQUEST] method={method}, timeout={timeout}s")
 
     if not all([ws_url, token, method]):
         return {"error": "Missing ws_url, token, or method"}
 
     try:
         client = get_ws_client(ws_url, token)
-        result = await client.request(method, args)
+        result = await client.request(method, args, timeout=timeout)
         return result
 
     except Exception as e:
-        logging.error("[FINAL FAILURE ERROR] " + str(e))
+        logging.error(f"[FINAL FAILURE ERROR] {str(e)}")
         return {"error": str(e)}
